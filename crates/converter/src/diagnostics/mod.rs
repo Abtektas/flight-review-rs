@@ -238,6 +238,8 @@ pub enum Evidence {
         /// Region length from the loss to its end.
         invalid_duration_ms: u64,
         ended_by: PositionAidingLossEnd,
+        /// Flight mode at the last valid sample; it decides the severity.
+        flight_mode: String,
     },
 }
 
@@ -328,7 +330,8 @@ struct VehicleStatusSample {
 struct InstanceState<A> {
     analyzer: A,
     last_status: Option<u64>,
-    last_measurement: Option<u64>,
+    /// Newest timestamp seen per measurement topic.
+    last_measurement: BTreeMap<String, u64>,
 }
 
 impl<A: Analyzer> InstanceState<A> {
@@ -354,6 +357,11 @@ impl<A: Analyzer> InstanceState<A> {
 
 /// Isolate sensor state and associate it with primary vehicle status by time,
 /// not arrival order. Status updates newer than a measurement are deferred.
+///
+/// Stale samples are dropped per topic, not per instance: an analyzer that
+/// reads two topics from one instance still gets a sparse update (such as a
+/// land detector change) that is written after a newer sample of the other
+/// topic. Such an update reaches the analyzer late, with its own timestamp.
 struct PerInstance<A> {
     prototype: A,
     instances: BTreeMap<u8, InstanceState<A>>,
@@ -424,14 +432,15 @@ impl<A: Analyzer + Default> Analyzer for PerInstance<A> {
             return;
         }
         let instance = self.instances.entry(data.multi_id.value()).or_default();
-        if instance
-            .last_measurement
-            .is_some_and(|previous| ts <= previous)
-        {
-            return;
+        let topic = data.flattened_format.message_name.as_str();
+        match instance.last_measurement.get_mut(topic) {
+            Some(previous) if ts <= *previous => return,
+            Some(previous) => *previous = ts,
+            None => {
+                instance.last_measurement.insert(topic.to_string(), ts);
+            }
         }
         instance.apply_status_through(&self.vehicle_status, ts);
-        instance.last_measurement = Some(ts);
         instance.analyzer.on_message(data);
     }
 

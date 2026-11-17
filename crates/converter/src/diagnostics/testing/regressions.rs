@@ -1,5 +1,7 @@
 use super::{analyze_fixture_for, analyzer, feed, MessageBuilder as B};
-use crate::diagnostics::{Analyzer, AnomalyKind, Diagnostic, Evidence, Severity};
+use crate::diagnostics::{
+    Analyzer, AnomalyKind, Diagnostic, Evidence, PositionAidingLossEnd, Severity,
+};
 
 fn arm(a: &mut dyn Analyzer) {
     feed(
@@ -591,14 +593,12 @@ fn rc_recovery_preserves_pre_loss_signal_evidence() {
 
 #[test]
 fn position_aiding_loss_instances_stale_samples_and_deferred_disarm() {
-    use crate::diagnostics::PositionAidingLossEnd;
-
     let mut a = analyzer("position_aiding_loss");
     arm(a.as_mut());
     feed(a.as_mut(), land(500_000, false), 0);
     feed(a.as_mut(), local_position(1_000_000, true), 0);
-    // A stale land-detected sample cannot end the flight retroactively.
-    feed(a.as_mut(), land(900_000, true), 0);
+    // A land-detected sample older than the last one is dropped.
+    feed(a.as_mut(), land(400_000, true), 0);
     feed(a.as_mut(), local_position(2_000_000, false), 0);
     // Instance 1 has no land-detected state of its own, so it never fires.
     feed(a.as_mut(), local_position(1_000_000, true), 1);
@@ -626,12 +626,178 @@ fn position_aiding_loss_instances_stale_samples_and_deferred_disarm() {
             last_valid_timestamp_us,
             invalid_duration_ms,
             ended_by,
+            flight_mode,
         } => {
             assert_eq!(*last_valid_timestamp_us, 1_000_000);
             assert_eq!(*invalid_duration_ms, 1_000);
             assert_eq!(*ended_by, PositionAidingLossEnd::Disarmed);
+            assert_eq!(flight_mode, "Unknown");
         }
         other => panic!("unexpected evidence {other:?}"),
     }
     assert_eq!(diags[0].severity, Severity::Warning);
+}
+
+/// Runs `position_aiding_loss` over instance-0 messages in the given file
+/// order and returns (start, end, ended_by) of each reported region.
+fn position_loss_regions(messages: Vec<B>) -> Vec<(u64, u64, PositionAidingLossEnd)> {
+    let mut a = analyzer("position_aiding_loss");
+    arm(a.as_mut());
+    for message in messages {
+        feed(a.as_mut(), message, 0);
+    }
+    a.finish()
+        .into_iter()
+        .map(|d| match (d.kind, d.evidence) {
+            (
+                AnomalyKind::Region { end_timestamp_us },
+                Evidence::PositionAidingLoss { ended_by, .. },
+            ) => (d.timestamp_us, end_timestamp_us, ended_by),
+            other => panic!("unexpected diagnostic {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn position_aiding_loss_keeps_a_late_takeoff() {
+    // The takeoff update (1.2s) is written after a newer position sample.
+    let regions = position_loss_regions(vec![
+        land(500_000, true),
+        local_position(1_000_000, true),
+        local_position(1_300_000, true),
+        land(1_200_000, false),
+        local_position(2_000_000, false),
+        local_position(3_000_000, true),
+    ]);
+    assert_eq!(
+        regions,
+        [(2_000_000, 3_000_000, PositionAidingLossEnd::Recovered)]
+    );
+}
+
+#[test]
+fn position_aiding_loss_keeps_a_late_landing() {
+    // The landing update (3.0s) is written after a newer position sample.
+    let regions = position_loss_regions(vec![
+        land(500_000, false),
+        local_position(1_000_000, true),
+        local_position(2_000_000, false),
+        local_position(3_100_000, false),
+        land(3_000_000, true),
+        local_position(3_200_000, false),
+    ]);
+    assert_eq!(
+        regions,
+        [(2_000_000, 3_000_000, PositionAidingLossEnd::Landed)]
+    );
+}
+
+#[test]
+fn position_aiding_loss_late_update_at_the_loss_start() {
+    // Took off at 1.9s, written after the first invalid sample: reported.
+    let regions = position_loss_regions(vec![
+        land(500_000, true),
+        local_position(1_000_000, true),
+        local_position(2_000_000, false),
+        land(1_900_000, false),
+        local_position(2_500_000, false),
+        local_position(3_000_000, true),
+    ]);
+    assert_eq!(
+        regions,
+        [(2_000_000, 3_000_000, PositionAidingLossEnd::Recovered)]
+    );
+
+    // Landed at 1.9s, written after the first invalid sample: on the ground.
+    let regions = position_loss_regions(vec![
+        land(500_000, false),
+        local_position(1_000_000, true),
+        local_position(2_000_000, false),
+        land(1_900_000, true),
+        local_position(2_500_000, false),
+    ]);
+    assert_eq!(regions, []);
+}
+
+#[test]
+fn position_aiding_loss_late_update_after_the_region_ended() {
+    let disarm = |ts| {
+        B::new("vehicle_status")
+            .timestamp(ts)
+            .field_u8("arming_state", 1)
+    };
+
+    // Landed at 3.0s, written after the estimate was valid again at 3.1s.
+    let regions = position_loss_regions(vec![
+        land(500_000, false),
+        local_position(1_000_000, true),
+        local_position(2_000_000, false),
+        local_position(3_100_000, true),
+        land(3_000_000, true),
+    ]);
+    assert_eq!(
+        regions,
+        [(2_000_000, 3_000_000, PositionAidingLossEnd::Landed)]
+    );
+
+    // Landed at 1.9s, written after the region ended: it began on the ground.
+    let regions = position_loss_regions(vec![
+        land(500_000, false),
+        local_position(1_000_000, true),
+        local_position(2_000_000, false),
+        local_position(3_000_000, true),
+        land(1_900_000, true),
+    ]);
+    assert_eq!(regions, []);
+
+    // Took off at 1.9s, written after the region ended: it was in air.
+    let regions = position_loss_regions(vec![
+        land(500_000, true),
+        local_position(1_000_000, true),
+        local_position(2_000_000, false),
+        local_position(3_000_000, true),
+        land(1_900_000, false),
+    ]);
+    assert_eq!(
+        regions,
+        [(2_000_000, 3_000_000, PositionAidingLossEnd::Recovered)]
+    );
+
+    // Landed at 2.8s, written after the disarm at 3.0s was applied.
+    let regions = position_loss_regions(vec![
+        land(500_000, false),
+        local_position(1_000_000, true),
+        local_position(2_000_000, false),
+        disarm(3_000_000),
+        local_position(3_100_000, false),
+        land(2_800_000, true),
+    ]);
+    assert_eq!(
+        regions,
+        [(2_000_000, 2_800_000, PositionAidingLossEnd::Landed)]
+    );
+
+    // Took off at 1.9s, written after the disarm at 3.0s was applied.
+    let regions = position_loss_regions(vec![
+        land(500_000, true),
+        local_position(1_000_000, true),
+        local_position(2_000_000, false),
+        disarm(3_000_000),
+        local_position(3_100_000, false),
+        land(1_900_000, false),
+    ]);
+    assert_eq!(
+        regions,
+        [(2_000_000, 3_000_000, PositionAidingLossEnd::Disarmed)]
+    );
+
+    // A takeoff after the loss start does not confirm it, even when late.
+    let regions = position_loss_regions(vec![
+        land(500_000, true),
+        local_position(1_000_000, true),
+        local_position(2_000_000, false),
+        local_position(3_000_000, true),
+        land(2_100_000, false),
+    ]);
+    assert_eq!(regions, []);
 }

@@ -5,8 +5,8 @@ expression: diags
 [
   {
     "id": "position_aiding_loss",
-    "summary": "Horizontal position estimate became invalid in air at 154.3s, 5.6s until landing",
-    "severity": "warning",
+    "summary": "Position aiding lost in air at 154.3s in Position mode: horizontal position estimate invalid for 5.6s until landing",
+    "severity": "critical",
     "kind": {
       "region": {
         "end_timestamp_us": 159900920
@@ -30,6 +30,10 @@ expression: diags
         {
           "name": "ended_by",
           "unit": "label"
+        },
+        {
+          "name": "flight_mode",
+          "unit": "label"
         }
       ]
     },
@@ -37,7 +41,8 @@ expression: diags
       "type": "PositionAidingLoss",
       "last_valid_timestamp_us": 154158949,
       "invalid_duration_ms": 5642,
-      "ended_by": "landed"
+      "ended_by": "landed",
+      "flight_mode": "Position"
     }
   }
 ]

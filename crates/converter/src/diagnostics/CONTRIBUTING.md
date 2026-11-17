@@ -14,7 +14,7 @@ Key properties to keep in mind when designing an analyzer:
 
 - **Single-pass, streaming.** Messages arrive in file order, not necessarily timestamp order. Handle stale/duplicate samples within a source and gaps explicitly. You don't get a random-access view of the whole log.
 - **One log at a time.** There is no batch/training phase. If your detector needs prior data (e.g. a trained model), it has to be baked into the binary as a constant, loaded from disk at startup, or derived from the current log's early samples before you start emitting results.
-- **Topic- and instance-scoped dispatch.** The factory wraps each analyzer core in `PerInstance`, isolating ULog `multi_id` state. Primary `vehicle_status` is associated by timestamp: newer status updates are deferred until measurements reach that time or the log ends. The last 128 status samples are retained; armed-only measurements older than retained history are conservatively omitted. A core receives only its source's measurements. Nonzero instances are included in `anchor.instance`; omitted means instance zero. Do not bypass the factory in production.
+- **Topic- and instance-scoped dispatch.** The factory wraps each analyzer core in `PerInstance`, isolating ULog `multi_id` state. Primary `vehicle_status` is associated by timestamp: newer status updates are deferred until measurements reach that time or the log ends. The last 128 status samples are retained; armed-only measurements older than retained history are conservatively omitted. Samples older than the last one of the same topic are dropped; topics are ordered separately, so a core that reads two topics from one instance can receive a sparse update late, with its own timestamp, and must handle that. A core receives only its source's measurements. Nonzero instances are included in `anchor.instance`; omitted means instance zero. Do not bypass the factory in production.
 - **Performance budget.** The whole diagnostic pass has a 500ms budget enforced by `cargo bench` in CI. A ~4MB log currently runs in ~37ms end-to-end. Stay cheap per message.
 
 ## Step 1: Add an `Evidence` variant
@@ -246,7 +246,10 @@ validity flag, cell count, usable baseline or adequate sampling may be unavailab
   from valid to invalid while armed and not landed. It does not name the lost
   aiding source, and a vehicle that never had a valid horizontal estimate is
   not reported. Regions end on recovery, landing, disarm or the last observed
-  invalid sample.
+  invalid sample. Severity is Critical when the flight mode at the last valid
+  sample needs a position estimate (Position, an automatic mode, Orbit or
+  Offboard) and Warning otherwise; there is no minimum duration. Vertical
+  validity (`z_valid`, `v_z_valid`) is out of scope.
 
 Fixture ground truth established during the correctness audit:
 
